@@ -1,4 +1,6 @@
 package com.abk.kernel.utils
+import com.abk.kernel.tr
+import com.abk.kernel.R
 
 import android.content.Context
 import android.content.pm.ApplicationInfo
@@ -12,11 +14,19 @@ import com.abk.kernel.data.model.RootGrantProfile
 import com.topjohnwu.superuser.CallbackList
 import com.topjohnwu.superuser.Shell
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.Collections
 import java.util.Properties
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 
 object RootUtils {
@@ -31,10 +41,17 @@ object RootUtils {
     private const val BUNDLED_KSUD_BINARY_NAME = "ksud"
     private const val BUNDLED_KSUD_METADATA_NAME = "source.properties"
     private const val BUNDLED_KSUD_INSTALL_DIR = "bundled-ksud"
+    private const val ABK_META_MOUNT_ID = "meta-abk-mount"
+    private const val ABK_META_MOUNT_DIR = "/data/adb/modules/meta-abk-mount"
+    private const val ABK_META_MOUNT_WEB_ROOT = "/data/adb/modules/meta-abk-mount/webroot"
+    private const val ABK_META_MOUNT_SYSFS_ENABLED = "/sys/kernel/abk_meta_mount/enabled"
+    private const val ABK_META_MOUNT_SYSFS_PREPARE = "/sys/kernel/abk_meta_mount/prepare"
     private val BOOT_PATCH_PARTITIONS = listOf("init_boot", "boot", "vendor_boot")
     private val KSU_FEATURE_NAME_REGEX = Regex("^[a-z0-9_]+$")
     private var appContext: Context? = null
     private val bundledKsudLock = Any()
+    @Volatile
+    private var abkMetaMountPlaceholderEnsured = false
 
     private data class BundledKsudMetadata(
         val ref: String,
@@ -50,6 +67,11 @@ object RootUtils {
                     .joinToString("-")
                 return raw.replace(Regex("""[^A-Za-z0-9._-]"""), "_").ifBlank { "default" }
             }
+    }
+
+    enum class Ak3SlotTarget(val slotSelectValue: String) {
+        CURRENT("active"),
+        INACTIVE("inactive")
     }
 
     fun init(context: Context) {
@@ -172,11 +194,13 @@ object RootUtils {
             sync
             echo "[ABK] 模块安装完成，通常需要重启后生效"
         """.trimIndent()
-        return execRootScript(
+        val result = execRootScript(
             withManagerShellHelpers(script),
             timeoutSeconds = 240,
             onOutput = onOutput
         )
+        if (result.success) triggerAbkMetaMountPrepare()
+        return result
     }
 
     fun installApk(
@@ -186,7 +210,7 @@ object RootUtils {
     ): ShellResult {
         val source = File(apkPath)
         if (!source.isFile) {
-            val line = "APK 文件不存在: $apkPath"
+            val line = tr(R.string.ru_apk_not_found, apkPath)
             onOutput?.invoke(line)
             return ShellResult(false, listOf(line))
         }
@@ -243,16 +267,35 @@ object RootUtils {
     fun flashAnyKernel3(
         context: Context,
         zipPath: String,
+        targetSlot: Ak3SlotTarget = Ak3SlotTarget.CURRENT,
         onOutput: ((String) -> Unit)? = null
     ): ShellResult {
+        val sourceZip = File(zipPath)
+        if (!sourceZip.isFile) {
+            val line = tr(R.string.ru_boot_image_not_found, zipPath)
+            onOutput?.invoke(line)
+            return ShellResult(false, listOf(line))
+        }
         val workDir = File(context.filesDir, "ak3-flash").apply {
             deleteRecursively()
             mkdirs()
         }
         val scriptFile = File(workDir, "flash_ak3.sh")
         return try {
+            val preparedZip = prepareAnyKernel3Zip(sourceZip, targetSlot, workDir, onOutput)
+                ?: return ShellResult(
+                    false,
+                    listOf(
+                        if (targetSlot == Ak3SlotTarget.INACTIVE) {
+                            "[ABK] 当前 AnyKernel3 不支持切换到另一槽位"
+                        } else {
+                            "[ABK] 准备 AnyKernel3 失败"
+                        }
+                    )
+                )
+            onOutput?.invoke("[ABK] 目标槽位: ${if (targetSlot == Ak3SlotTarget.INACTIVE) "另一槽位" else "当前槽位"}")
             scriptFile.writeText(AK3_FLASH_SCRIPT)
-            val script = "F=${shellQuote(workDir.absolutePath)} Z=${shellQuote(zipPath)} /system/bin/sh ${shellQuote(scriptFile.absolutePath)}"
+            val script = "F=${shellQuote(workDir.absolutePath)} Z=${shellQuote(preparedZip.absolutePath)} /system/bin/sh ${shellQuote(scriptFile.absolutePath)}"
             execRootScript(script, timeoutSeconds = 300L, onOutput = onOutput)
         } finally {
             workDir.deleteRecursively()
@@ -304,6 +347,19 @@ object RootUtils {
         return readEmbeddedBootInfoLine(args)
     }
 
+    fun supportsAnyKernelInactiveSlot(): Boolean {
+        val suffix = detectBootSlotSuffix()
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it == "_a" || it == "_b" }
+            ?: detectSystemProperty("ro.boot.slot_suffix")
+                ?.trim()
+                ?.lowercase()
+                ?.takeIf { it == "_a" || it == "_b" }
+        if (suffix != null) return true
+        return BOOT_PATCH_PARTITIONS.any { partitionExists("${it}_a") && partitionExists("${it}_b") }
+    }
+
     private fun detectCurrentKmiFallback(): String? {
         val release = getKernelVersion().lowercase()
         Regex("""(\d+\.\d+).*?(android\d+)""").find(release)?.let { match ->
@@ -342,8 +398,6 @@ object RootUtils {
     fun resolveUserlandKsudPath(context: Context): String? =
         prepareBundledKsudPath(context) ?: embeddedKsudPath(context)
 
-    fun resolveUserlandMagiskbootPath(context: Context): String? = embeddedMagiskbootPath(context)
-
     fun patchAbkLkmBootImage(
         context: Context,
         bootImagePath: String?,
@@ -362,20 +416,20 @@ object RootUtils {
             ?.takeIf { it.isNotBlank() }
             ?.let { File(it) }
         if (sourceBoot != null && !sourceBoot.isFile) {
-            return BootPatchResult(false, listOf("boot 镜像不存在: $bootImagePath"), null)
+            return BootPatchResult(false, listOf(tr(R.string.ru_boot_image_not_found, bootImagePath)), null)
         }
 
         val localModule = localModulePath
             ?.takeIf { it.isNotBlank() }
             ?.let { File(it) }
         if (localModule != null && !localModule.isFile) {
-            return BootPatchResult(false, listOf("LKM 文件不存在: $localModulePath"), null)
+            return BootPatchResult(false, listOf(tr(R.string.ru_lkm_file_not_found, localModulePath)), null)
         }
 
         val asset = if (localModule == null) {
             listBundledAbkLkmAssets(context).firstOrNull {
                 it.variantId == variantId && it.kmi == kmi
-            } ?: return BootPatchResult(false, listOf("未内置 $variantId / $kmi 的 LKM 模块"), null)
+            } ?: return BootPatchResult(false, listOf(tr(R.string.ru_lkm_module_not_bundled, variantId, kmi)), null)
         } else {
             null
         }
@@ -413,9 +467,9 @@ object RootUtils {
             )
             val requiresRootShell = flash || sourceBoot == null
             if (asset != null) {
-                onOutput?.invoke("[ABK] 使用 APK 内置 LKM: ${asset.variantLabel} · ${asset.kmi}")
+                onOutput?.invoke(tr(R.string.ru_log_using_bundled_lkm, asset.variantLabel, asset.kmi))
             } else {
-                onOutput?.invoke("[ABK] 使用本地 LKM: ${moduleFile.name}")
+                onOutput?.invoke(tr(R.string.ru_log_using_local_lkm, moduleFile.name))
             }
             val result = when {
                 allowRootFallback -> {
@@ -427,27 +481,27 @@ object RootUtils {
                     when {
                         rootResult != null -> rootResult
                         !requiresRootShell -> {
-                            onOutput?.invoke("[ABK] Root shell 不可用，改用 APK 内置 SukiSU-Ultra ksud 仅修补本地 boot 镜像")
+                            onOutput?.invoke(tr(R.string.ru_log_no_root_shell_local_patch))
                             runBundledUserlandBootPatch(
                                 context = context,
                                 args = baseArgs,
                                 onOutput = onOutput
                             ) ?: ShellResult(
                                 false,
-                                listOf("未找到可执行的 APK 内置 SukiSU-Ultra ksud；无 Root 时只能在选择 boot.img 后生成 patched 镜像。")
+                                listOf(tr(R.string.ru_no_embedded_ksud))
                             )
                         }
-                        else -> ShellResult(false, listOf("该安装方式需要 Root 权限。"))
+                        else -> ShellResult(false, listOf(tr(R.string.ru_install_requires_root)))
                     }
                 }
-                requiresRootShell -> ShellResult(false, listOf("该安装方式需要 Root 权限。"))
+                requiresRootShell -> ShellResult(false, listOf(tr(R.string.ru_install_requires_root)))
                 else -> runBundledUserlandBootPatch(
                     context = context,
                     args = baseArgs,
                     onOutput = onOutput
                 ) ?: ShellResult(
                     false,
-                    listOf("未找到可执行的 APK 内置 SukiSU-Ultra ksud；无 Root 时只能在选择 boot.img 后生成 patched 镜像。")
+                    listOf(tr(R.string.ru_no_embedded_ksud))
                 )
             }
             val outputPath = outputImage.takeIf { result.success && it.isFile }?.absolutePath
@@ -507,7 +561,7 @@ object RootUtils {
         return if (status != null) {
             ShellResult(true, listOf(status))
         } else {
-            ShellResult(false, listOf("未激活"))
+            ShellResult(false, listOf(tr(R.string.ru_not_active)))
         }
     }
 
@@ -527,6 +581,13 @@ object RootUtils {
                 ?.takeIf { it.isNotBlank() && it.startsWith("{") }
         }
 
+        if (control?.contains(ABK_META_MOUNT_ID) == true ||
+            runCatching { File(ABK_META_MOUNT_SYSFS_ENABLED).exists() }.getOrDefault(false)
+        ) {
+            ensureAbkMetaMountPlaceholder()
+            triggerAbkMetaMountPrepare()
+        }
+
         val modules = listKsuModules().takeIf { it.success }
             ?.output
             ?.joinToString("\n")
@@ -537,7 +598,7 @@ object RootUtils {
             return ManagerRuntimeSnapshot(
                 manager = manager.copy(
                     active = false,
-                    diagnostics = (manager.diagnostics + "仅检测到通用 su shell，未检测到可用于 ABK 运行态管理的 KernelSU/ReSukiSU 控制接口。").distinct()
+                    diagnostics = (manager.diagnostics + tr(R.string.ru_only_generic_su)).distinct()
                 )
             )
         }
@@ -621,13 +682,13 @@ object RootUtils {
                 }
             }
             2 -> setNativeKsuFeatureValue(FEATURE_SU_COMPAT, 0L, persist = true)
-            else -> ShellResult(false, listOf("未知 su 兼容模式"))
+            else -> ShellResult(false, listOf(tr(R.string.ru_unknown_su_compat)))
         }
     }
 
     fun setKsuFeatureEnabled(featureName: String, enabled: Boolean): ShellResult {
         val feature = normalizeKsuFeatureName(featureName)
-            ?: return ShellResult(false, listOf("未知 Feature"))
+            ?: return ShellResult(false, listOf(tr(R.string.ru_unknown_feature)))
         val value = if (enabled) 1L else 0L
         return if (feature == FEATURE_ADB_ROOT) {
             val setResult = setKsuFeatureValue(feature, value, persist = false)
@@ -668,7 +729,7 @@ object RootUtils {
     fun readAppProfileTemplate(id: String): ShellResult {
         if (!isNativeManagerActive()) return nativeManagerPermissionDeniedResult()
         if (!isSafeTemplateId(id)) {
-            return ShellResult(false, listOf("模板名称无效"))
+            return ShellResult(false, listOf(tr(R.string.ru_invalid_template_name)))
         }
         return runKsudCommand("profile get-template ${shellQuote(id)}", timeoutSeconds = 30L)
     }
@@ -676,7 +737,7 @@ object RootUtils {
     fun writeAppProfileTemplate(id: String, content: String): ShellResult {
         if (!isNativeManagerActive()) return nativeManagerPermissionDeniedResult()
         if (!isSafeTemplateId(id)) {
-            return ShellResult(false, listOf("模板名称无效"))
+            return ShellResult(false, listOf(tr(R.string.ru_invalid_template_name)))
         }
         return runKsudCommand(
             "profile set-template ${shellQuote(id)} ${shellQuote(content)}",
@@ -687,7 +748,7 @@ object RootUtils {
     fun deleteAppProfileTemplate(id: String): ShellResult {
         if (!isNativeManagerActive()) return nativeManagerPermissionDeniedResult()
         if (!isSafeTemplateId(id)) {
-            return ShellResult(false, listOf("模板名称无效"))
+            return ShellResult(false, listOf(tr(R.string.ru_invalid_template_name)))
         }
         return runKsudCommand("profile delete-template ${shellQuote(id)}", timeoutSeconds = 30L)
     }
@@ -711,6 +772,42 @@ object RootUtils {
             abk_exec_ksud "${'$'}ksud_path" module action $safeId
         """.trimIndent()
         return execRootScript(withManagerShellHelpers(script), timeoutSeconds = 300L, onOutput = onOutput)
+    }
+
+    fun ensureAbkMetaMountPlaceholder(force: Boolean = false): ShellResult {
+        if (!force && abkMetaMountPlaceholderEnsured) return ShellResult(true, emptyList())
+
+        val result = execRootScript(abkMetaMountPlaceholderScript(), timeoutSeconds = 30L)
+        if (result.success) abkMetaMountPlaceholderEnsured = true
+        return result
+    }
+
+    fun triggerAbkMetaMountPrepare(): ShellResult {
+        val script = """
+            set -e
+            [ -e ${shellQuote(ABK_META_MOUNT_SYSFS_PREPARE)} ] || exit 0
+            echo 1 > ${shellQuote(ABK_META_MOUNT_SYSFS_PREPARE)} 2>/dev/null || true
+        """.trimIndent()
+        return execRootScript(script, timeoutSeconds = 30L)
+    }
+
+    fun runModuleActionScript(moduleDir: String, onOutput: ((String) -> Unit)? = null): ShellResult {
+        val cleanDir = moduleDir.trim().ifBlank { "/data/adb/modules" }
+        val safeDir = shellQuote(cleanDir)
+        val script = """
+            set -e
+            MOD=$safeDir
+            ACTION="${'$'}MOD/action.sh"
+            [ -f "${'$'}ACTION" ] || { echo "action.sh not found"; exit 2; }
+            cd "${'$'}MOD" 2>/dev/null || exit 2
+            /system/bin/sh "${'$'}ACTION"
+        """.trimIndent()
+        if (isAbkMetaMountModuleDir(cleanDir)) {
+            val ensureResult = ensureAbkMetaMountPlaceholder(force = true)
+            if (!ensureResult.success) return ensureResult
+            triggerAbkMetaMountPrepare()
+        }
+        return execRootScript(script, timeoutSeconds = 300L, onOutput = onOutput)
     }
 
     fun setKsuModuleEnabled(moduleId: String, enabled: Boolean): ShellResult {
@@ -779,8 +876,33 @@ object RootUtils {
         return if (AbkKsuNative.controlCommand(command)) {
             ShellResult(true, emptyList())
         } else {
-            ShellResult(false, listOf("未激活"))
+            ShellResult(false, listOf(tr(R.string.ru_not_active)))
         }
+    }
+
+    fun setAbkMetaMountEnabled(enabled: Boolean): ShellResult {
+        val ensureResult = ensureAbkMetaMountPlaceholder(force = true)
+        if (!ensureResult.success) return ensureResult
+        val script = """
+            set -e
+            SYS=${shellQuote(ABK_META_MOUNT_SYSFS_ENABLED)}
+            PREPARE=${shellQuote(ABK_META_MOUNT_SYSFS_PREPARE)}
+            MOD=${shellQuote(ABK_META_MOUNT_DIR)}
+            [ -e "${'$'}SYS" ] || { echo "abk_meta_mount sysfs not found"; exit 2; }
+            mkdir -p "${'$'}MOD"
+            if [ "${if (enabled) "1" else "0"}" = "1" ]; then
+                rm -f "${'$'}MOD/disable" "${'$'}MOD/remove"
+                echo 1 > "${'$'}SYS"
+                [ -e "${'$'}PREPARE" ] && echo 1 > "${'$'}PREPARE" || true
+            else
+                touch "${'$'}MOD/disable"
+                rm -f "${'$'}MOD/remove"
+                echo 0 > "${'$'}SYS"
+            fi
+            state=${'$'}(cat "${'$'}SYS" 2>/dev/null || echo unknown)
+            [ "${if (enabled) "1" else "0"}" = "${'$'}state" ] || { echo "abk_meta_mount enable state mismatch: ${'$'}state"; exit 3; }
+        """.trimIndent()
+        return execRootScript(script, timeoutSeconds = 30L)
     }
 
     fun execRootCommandForWebUi(command: String, cwd: String = "", timeoutSeconds: Long = 120L): ShellResult {
@@ -797,8 +919,13 @@ object RootUtils {
         val cleanRelativePath = sanitizeWebRelativePath(relativePath) ?: return null
         if (cleanId.isBlank()) return null
 
+        if (isAbkMetaMountModuleId(cleanId)) {
+            ensureAbkMetaMountPlaceholder()
+            triggerAbkMetaMountPrepare()
+        }
+
         val filePath = "/data/adb/modules/$cleanId/webroot/$cleanRelativePath"
-        return try {
+        fun readOnce(): ByteArray? = try {
             createRootShell(timeoutSeconds = 30L).use { shell ->
                 val result = execWithShell(
                     shell = shell,
@@ -816,12 +943,21 @@ object RootUtils {
         } catch (error: Throwable) {
             null
         }
+
+        return readOnce() ?: if (isAbkMetaMountModuleId(cleanId)) {
+            ensureAbkMetaMountPlaceholder(force = true)
+            triggerAbkMetaMountPrepare()
+            readOnce()
+        } else {
+            null
+        }
     }
 
     fun moduleInfoJson(moduleId: String): String {
         val cleanId = moduleId.trim()
         if (cleanId.isBlank()) return "{}"
         val moduleDir = "/data/adb/modules/$cleanId"
+        val webRoot = "$moduleDir/webroot"
         val modules = listKsuModules().takeIf { it.success }?.output?.joinToString("\n").orEmpty()
         val moduleJson = runCatching {
             val array = org.json.JSONArray(modules.ifBlank { "[]" })
@@ -829,16 +965,81 @@ object RootUtils {
                 val item = array.optJSONObject(index) ?: continue
                 if (item.optString("id") == cleanId) {
                     item.put("moduleDir", moduleDir)
+                    item.put("webRoot", webRoot)
                     return@runCatching item.toString()
                 }
             }
             org.json.JSONObject()
                 .put("id", cleanId)
                 .put("moduleDir", moduleDir)
+                .put("webRoot", webRoot)
                 .toString()
         }.getOrDefault("{}")
         return moduleJson
     }
+
+    private fun abkMetaMountPlaceholderScript(): String = """
+        set -e
+        MOD=${shellQuote(ABK_META_MOUNT_DIR)}
+        WEB=${shellQuote(ABK_META_MOUNT_WEB_ROOT)}
+        MARK='/data/adb/metamodule'
+        mkdir -p "${'$'}MOD" "${'$'}WEB"
+        cat > "${'$'}MOD/module.prop" <<'ABK_META_PROP'
+        id=meta-abk-mount
+        name=ABK Meta Mount
+        version=0.1.0
+        versionCode=1
+        author=ABK
+        description=Built-in KernelSU-compatible metamodule provider
+        metamodule=1
+        mount=false
+        skip_mount=true
+        web=1
+        webui=1
+        action=1
+        ABK_META_PROP
+        cat > "${'$'}MOD/metamount.sh" <<'ABK_META_METAMOUNT'
+        #!/system/bin/sh
+        rm -f /data/adb/modules/meta-abk-mount/disable /data/adb/modules/meta-abk-mount/remove
+        echo 1 > /sys/kernel/abk_meta_mount/enabled 2>/dev/null || true
+        echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true
+        ABK_META_METAMOUNT
+        chmod 755 "${'$'}MOD/metamount.sh"
+        cat > "${'$'}MOD/action.sh" <<'ABK_META_ACTION'
+        #!/system/bin/sh
+        if [ -f /proc/abk_meta_mount/status ]; then
+            cat /proc/abk_meta_mount/status
+        else
+            echo 'ABK Meta Mount status unavailable'
+        fi
+        ABK_META_ACTION
+        chmod 755 "${'$'}MOD/action.sh"
+        cat > "${'$'}WEB/index.html" <<'ABK_META_WEB'
+        <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ABK Meta Mount</title><style>body{font-family:system-ui,sans-serif;margin:20px;line-height:1.45;color:#171717;background:#f7f7f4}main{max-width:760px}button{padding:10px 14px;margin:0 8px 10px 0;border:1px solid #888;background:#fff;border-radius:6px}pre{white-space:pre-wrap;background:#101820;color:#eef5f5;padding:12px;border-radius:6px;min-height:180px;overflow:auto}</style></head><body><main><h1>ABK Meta Mount</h1><p>Built-in KernelSU metamodule provider. Disable is persistent; already-mounted overlays may require reboot to fully unwind.</p><button onclick="refresh()">Refresh</button><button onclick="setEnabled(1)">Enable</button><button onclick="setEnabled(0)">Disable</button><pre id="out">Loading...</pre></main><script>function out(v){document.getElementById('out').textContent=v}function sh(c){try{if(window.ksu&&typeof window.ksu.exec==='function'){return window.ksu.exec(c)}return 'KernelSU WebUI exec API unavailable'}catch(e){return String(e)}}function refresh(){out(sh('echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true; cat /proc/abk_meta_mount/status 2>/dev/null || echo unavailable'))}function setEnabled(v){var c;if(v==1){c='rm -f /data/adb/modules/meta-abk-mount/disable /data/adb/modules/meta-abk-mount/remove; echo 1 > /sys/kernel/abk_meta_mount/enabled; echo 1 > /sys/kernel/abk_meta_mount/prepare 2>/dev/null || true'}else{c='mkdir -p /data/adb/modules/meta-abk-mount; touch /data/adb/modules/meta-abk-mount/disable; echo 0 > /sys/kernel/abk_meta_mount/enabled'}out(sh(c+'; cat /proc/abk_meta_mount/status 2>/dev/null || true'))}refresh()</script></body></html>
+        ABK_META_WEB
+        if [ -e "${'$'}MARK" ] && [ ! -L "${'$'}MARK" ]; then
+            :
+        else
+            TAKEOVER=0
+            if [ ! -e "${'$'}MARK" ]; then
+                TAKEOVER=1
+            elif [ -L "${'$'}MARK" ]; then
+                CUR=${'$'}(readlink "${'$'}MARK" 2>/dev/null || true)
+                if [ "${'$'}CUR" = "${'$'}MOD" ]; then
+                    TAKEOVER=1
+                elif [ -z "${'$'}CUR" ] || [ ! -d "${'$'}CUR" ] || [ -f "${'$'}CUR/disable" ] || [ -f "${'$'}CUR/remove" ]; then
+                    TAKEOVER=1
+                fi
+            fi
+            [ "${'$'}TAKEOVER" = 1 ] && ln -sfn "${'$'}MOD" "${'$'}MARK"
+        fi
+    """.trimIndent()
+
+    private fun isAbkMetaMountModuleId(moduleId: String): Boolean =
+        moduleId.trim() == ABK_META_MOUNT_ID
+
+    private fun isAbkMetaMountModuleDir(moduleDir: String): Boolean =
+        moduleDir.trim().trimEnd('/') == ABK_META_MOUNT_DIR
 
     @Suppress("DEPRECATION")
     private fun installedApplications(packageManager: PackageManager): List<ApplicationInfo> =
@@ -962,7 +1163,7 @@ object RootUtils {
 
     private fun runKsudCommand(args: String, timeoutSeconds: Long): ShellResult {
         val cleanArgs = args.trim()
-        if (cleanArgs.isBlank()) return ShellResult(false, listOf("ksud 参数为空"))
+        if (cleanArgs.isBlank()) return ShellResult(false, listOf(tr(R.string.ru_ksud_args_empty)))
         val script = """
             set -e
             ksud_path=${'$'}(abk_find_ksud)
@@ -1018,11 +1219,11 @@ object RootUtils {
         val setResult = when (featureName) {
             FEATURE_SU_COMPAT -> {
                 val ok = AbkKsuNative.setSuEnabled(enabled)
-                ShellResult(ok, if (ok) emptyList() else listOf("传统 su 命令支持切换失败"))
+                ShellResult(ok, if (ok) emptyList() else listOf(tr(R.string.ru_legacy_su_toggle_failed)))
             }
             FEATURE_SELINUX_HIDE -> {
                 val code = AbkKsuNative.setSelinuxHideEnabled(enabled)
-                ShellResult(code == 0, if (code == 0) emptyList() else listOf("隐藏 SELinux 修改切换失败: $code"))
+                ShellResult(code == 0, if (code == 0) emptyList() else listOf(tr(R.string.ru_hide_selinux_toggle_failed, code)))
             }
             else -> setKsuFeatureValue(featureName, value, persist = false)
         }
@@ -1106,7 +1307,7 @@ object RootUtils {
             val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!completed) {
                 process.destroyForcibly()
-                val line = "命令超时"
+                val line = tr(R.string.ru_command_timeout)
                 output.add(line)
                 onOutput?.invoke(line)
                 return ShellResult(false, output.toList())
@@ -1131,7 +1332,7 @@ object RootUtils {
             }
         } catch (error: Throwable) {
             Log.w(TAG, "root command failed", error)
-            val line = "管理器未激活"
+            val line = tr(R.string.ru_manager_not_active)
             onOutput?.invoke(line)
             ShellResult(false, listOf(line))
         }
@@ -1168,7 +1369,7 @@ object RootUtils {
         }
 
         return nativeRuntime ?: ManagerRuntimeProbe(
-            diagnostics = listOf("未检测到可用的 KernelSU/ReSukiSU 管理器接口或 Root shell。")
+            diagnostics = listOf(tr(R.string.ru_no_manager_interface))
         )
     }
 
@@ -1227,7 +1428,7 @@ object RootUtils {
                         capabilities = capabilities.ifEmpty { listOf("root_shell", "modules") },
                         diagnostics = (
                             nativeRuntime?.diagnostics.orEmpty() +
-                                "当前仅通过 ksud/root shell 兼容层工作，ABK 尚未被内核识别为原生管理器，无法管理 Root 授权策略。"
+                                tr(R.string.ru_diag_compat_shell_only)
                             ).distinct()
                     )
                 } else {
@@ -1240,7 +1441,7 @@ object RootUtils {
                         capabilities = listOf("root_shell"),
                         diagnostics = (
                             nativeRuntime?.diagnostics.orEmpty() +
-                                "当前仅有通用 su shell 可用，未检测到 KernelSU/ReSukiSU 原生管理器接口。"
+                                tr(R.string.ru_diag_generic_su_only)
                             ).distinct()
                     )
                 }
@@ -1270,7 +1471,7 @@ object RootUtils {
                 workMode = if (status.isLkmMode) "lkm" else "built-in",
                 capabilities = listOf("native_kernel"),
                 diagnostics = listOf(
-                    "KernelSU/ReSukiSU native 接口可访问，但当前 ABK APK 未被识别为管理器。请确认安装的是与内核构建时 ABK_MANAGER_CERT_SHA256 匹配的 com.abk.kernel 正式签名 APK。"
+                    tr(R.string.ru_diag_native_not_manager)
                 )
             )
         }
@@ -1290,7 +1491,7 @@ object RootUtils {
         val displayVariant = controlVariant.ifBlank { nativeVariant }
         val diagnostics = buildList {
             if (controlJson == null && !status.isLkmMode) {
-                add("ABK control 未响应；内核可能没有启用 CONFIG_ABK_CONTROL，或 ABK Control 外部模块缺少 before_build 阶段。")
+                add(tr(R.string.ru_diag_control_no_response))
             }
         }
         val capabilities = buildList {
@@ -1391,13 +1592,6 @@ object RootUtils {
     private fun buildKsudShellCommand(ksudPath: String, args: List<String>): String =
         buildShellCommand(buildKsudCommand(ksudPath, args))
 
-    private fun embeddedMagiskbootPath(context: Context? = appContext): String? {
-        val safeContext = context ?: return null
-        return File(safeContext.applicationInfo.nativeLibraryDir, "libmagiskboot.so")
-            .takeIf { it.isFile }
-            ?.absolutePath
-    }
-
     private fun runEmbeddedKsudWithRoot(
         context: Context,
         args: List<String>,
@@ -1489,10 +1683,6 @@ object RootUtils {
     ): List<String> {
         return buildList {
             add("boot-patch")
-            embeddedMagiskbootPath(context)?.let { magiskboot ->
-                add("--magiskboot")
-                add(magiskboot)
-            }
             if (bootImage != null) {
                 add("--boot")
                 add(bootImage.absolutePath)
@@ -1522,8 +1712,8 @@ object RootUtils {
         val embedded = embeddedKsudPath(context) ?: return null
         return try {
             createRootShell(timeoutSeconds = 300L).use { shell ->
-                onOutput?.invoke("[ABK] 通过 Root shell 调用内置 libksud.so")
-                onOutput?.invoke("[ABK] ksud 路径: $embedded")
+                onOutput?.invoke(tr(R.string.ru_log_invoke_libksud))
+                onOutput?.invoke(tr(R.string.ru_log_ksud_path, embedded))
                 execWithShell(
                     shell,
                     buildKsudShellCommand(embedded, args),
@@ -1542,8 +1732,8 @@ object RootUtils {
         onOutput: ((String) -> Unit)? = null
     ): ShellResult? {
         val userlandKsud = resolveUserlandKsudPath(context) ?: return null
-        onOutput?.invoke("[ABK] 使用 APK 内置 SukiSU-Ultra ksud 进行本地 boot 修补")
-        onOutput?.invoke("[ABK] ksud 路径: $userlandKsud")
+        onOutput?.invoke(tr(R.string.ru_log_local_boot_patch))
+        onOutput?.invoke(tr(R.string.ru_log_ksud_path, userlandKsud))
         return runLocalCommand(
             command = buildKsudCommand(userlandKsud, args),
             timeoutSeconds = 300L,
@@ -1738,16 +1928,16 @@ object RootUtils {
     ): List<String> {
         if (output.isNotEmpty()) return output.toList()
         val fallback = if (success) {
-            "[ABK] Root 命令执行完成，但命令未返回输出。"
+            tr(R.string.ru_log_done_no_output)
         } else {
-            "[ABK] Root 命令执行失败，但命令未返回输出。"
+            tr(R.string.ru_log_failed_no_output)
         }
         onOutput?.invoke(fallback)
         return listOf(fallback)
     }
 
     private fun nativeManagerPermissionDeniedMessage(): String =
-        "当前 ABK 没有原生管理权限，无法访问该功能。请使用已将 ABK 识别为原生管理器的内核。"
+        tr(R.string.ru_no_native_permission)
 
     private fun nativeManagerPermissionDeniedResult(): ShellResult =
         ShellResult(false, listOf(nativeManagerPermissionDeniedMessage()))
@@ -1760,10 +1950,125 @@ object RootUtils {
         ).any { File(it).exists() }
     }
 
+    private fun detectSystemProperty(name: String): String? {
+        return runCatching {
+            Runtime.getRuntime()
+                .exec(arrayOf("/system/bin/getprop", name))
+                .inputStream
+                .bufferedReader()
+                .use { it.readText().trim() }
+                .ifBlank { null }
+        }.getOrNull()
+    }
+
     private fun buildShellCommand(args: List<String>): String =
         args.joinToString(" ") { shellQuote(it) }
 
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\"'\"'")}'"
+
+    internal fun rewriteAnyKernelSlotSelect(
+        scriptContent: String,
+        targetSlot: Ak3SlotTarget
+    ): String? {
+        val lineRegex = Regex("""(?m)^([ \t]*slot_select=)[^\r\n]*$""")
+        val match = lineRegex.find(scriptContent) ?: return null
+        return buildString {
+            append(scriptContent.substring(0, match.range.first))
+            append(match.groupValues[1])
+            append(targetSlot.slotSelectValue)
+            append(scriptContent.substring(match.range.last + 1))
+        }
+    }
+
+    private fun prepareAnyKernel3Zip(
+        sourceZip: File,
+        targetSlot: Ak3SlotTarget,
+        workDir: File,
+        onOutput: ((String) -> Unit)?
+    ): File? {
+        val expandDir = File(workDir, "anykernel-src").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        unzipToDirectory(sourceZip, expandDir)
+        val anyKernelScript = expandDir.walkTopDown()
+            .firstOrNull { it.isFile && it.name.equals("anykernel.sh", ignoreCase = true) }
+        if (anyKernelScript == null) {
+            onOutput?.invoke("[ABK] AnyKernel3 缺少 anykernel.sh")
+            return null
+        }
+
+        val original = anyKernelScript.readText()
+        val rewritten = rewriteAnyKernelSlotSelect(original, targetSlot)
+        if (rewritten == null) {
+            return if (targetSlot == Ak3SlotTarget.CURRENT) {
+                onOutput?.invoke("[ABK] 未找到 slot_select，沿用 AK3 默认当前槽位行为")
+                sourceZip
+            } else {
+                onOutput?.invoke("[ABK] AnyKernel3 未声明 slot_select，无法切换到另一槽位")
+                null
+            }
+        }
+        if (rewritten == original) {
+            return sourceZip
+        }
+
+        anyKernelScript.writeText(rewritten)
+        onOutput?.invoke("[ABK] 已将 AnyKernel3 slot_select 设置为 ${targetSlot.slotSelectValue}")
+        val targetZip = File(workDir, "AnyKernel3-target.zip")
+        zipDirectory(expandDir, targetZip)
+        return targetZip
+    }
+
+    private fun unzipToDirectory(zipFile: File, outputDir: File) {
+        val outputCanonical = outputDir.canonicalFile
+        ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                val outputFile = File(outputDir, entry.name).canonicalFile
+                if (!outputFile.path.startsWith(outputCanonical.path + File.separator)) {
+                    throw SecurityException("Unsafe zip entry: ${entry.name}")
+                }
+                if (entry.isDirectory) {
+                    outputFile.mkdirs()
+                } else {
+                    outputFile.parentFile?.mkdirs()
+                    FileOutputStream(outputFile).use { output ->
+                        copyStream(zip, output)
+                    }
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+    }
+
+    private fun zipDirectory(sourceDir: File, outputZip: File) {
+        val sourceCanonical = sourceDir.canonicalFile
+        ZipOutputStream(FileOutputStream(outputZip)).use { zip ->
+            sourceDir.walkTopDown()
+                .filter { it.isFile }
+                .forEach { file ->
+                    val relativePath = sourceCanonical.toPath().relativize(file.canonicalFile.toPath())
+                        .toString()
+                        .replace(File.separatorChar, '/')
+                    zip.putNextEntry(ZipEntry(relativePath))
+                    FileInputStream(file).use { input ->
+                        copyStream(input, zip)
+                    }
+                    zip.closeEntry()
+                }
+        }
+    }
+
+    private fun copyStream(input: InputStream, output: OutputStream) {
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read == -1) break
+            output.write(buffer, 0, read)
+        }
+    }
 
     private val AK3_FLASH_SCRIPT = """
 #!/system/bin/sh

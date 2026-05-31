@@ -1,4 +1,6 @@
 package com.abk.kernel.data.repository
+import com.abk.kernel.tr
+import com.abk.kernel.R
 
 import com.abk.kernel.BuildConfig
 import com.abk.kernel.data.api.GitHubApiService
@@ -25,7 +27,7 @@ sealed class Result<out T> {
 
 class GitHubRepository(
     private val authService: GitHubAuthService = NetworkClient.createAuthService(),
-    private var apiService: GitHubApiService? = null
+    private var apiService: GitHubApiService = NetworkClient.createApiService()
 ) {
     private val clientId = BuildConfig.GITHUB_CLIENT_ID
     private val publicHttpClient = OkHttpClient.Builder()
@@ -33,7 +35,7 @@ class GitHubRepository(
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    fun updateToken(token: String) {
+    fun updateToken(token: String?) {
         apiService = NetworkClient.createApiService(token)
     }
 
@@ -63,7 +65,7 @@ class GitHubRepository(
         withContext(Dispatchers.IO) {
             val candidates = externalModuleConfCandidates(repositoryUrl)
             if (candidates.isEmpty()) {
-                return@withContext Result.Error("模块仓库链接格式不支持")
+                return@withContext Result.Error(tr(R.string.gh_repo_link_unsupported))
             }
 
             var lastError = ""
@@ -74,7 +76,7 @@ class GitHubRepository(
                     .build()
                 val response = runCatching { publicHttpClient.newCall(request).execute() }
                     .getOrElse {
-                        lastError = it.message ?: "网络请求失败"
+                        lastError = it.message ?: tr(R.string.gh_network_request_failed)
                         null
                     } ?: continue
 
@@ -88,19 +90,19 @@ class GitHubRepository(
                     return@withContext runCatching { parseExternalModuleConf(body) }
                         .fold(
                             onSuccess = { Result.Success(it) },
-                            onFailure = { Result.Error("module.conf 无效: ${it.message ?: "格式错误"}") }
+                            onFailure = { Result.Error(tr(R.string.gh_module_conf_invalid, it.message ?: tr(R.string.gh_format_error))) }
                         )
                 }
             }
 
-            Result.Error("无法读取 module.conf: $lastError")
+            Result.Error(tr(R.string.gh_module_conf_unreadable, lastError))
         }
 
-    suspend fun fetchModuleCatalog(repositoryUrl: String): Result<ModuleCatalogFetchResult> =
+    suspend fun fetchBuildModuleCatalog(repositoryUrl: String): Result<ModuleCatalogFetchResult> =
         withContext(Dispatchers.IO) {
             val candidates = moduleCatalogIndexCandidates(repositoryUrl)
             if (candidates.isEmpty()) {
-                return@withContext Result.Error("模块仓库链接格式不支持")
+                return@withContext Result.Error(tr(R.string.gh_repo_link_unsupported))
             }
 
             var lastError = ""
@@ -111,7 +113,7 @@ class GitHubRepository(
                     .build()
                 val response = runCatching { publicHttpClient.newCall(request).execute() }
                     .getOrElse {
-                        lastError = it.message ?: "网络请求失败"
+                        lastError = it.message ?: tr(R.string.gh_network_request_failed)
                         null
                     } ?: continue
 
@@ -124,7 +126,7 @@ class GitHubRepository(
                     val body = resp.body?.string().orEmpty()
                     val catalog = runCatching { parseModuleCatalogDocument(body, repositoryUrl) }
                         .getOrElse {
-                            lastError = "JSON 解析失败: ${it.message ?: "格式错误"}"
+                            lastError = tr(R.string.gh_json_parse_failed, it.message ?: tr(R.string.gh_format_error))
                             return@use
                         }
 
@@ -139,13 +141,59 @@ class GitHubRepository(
                 }
             }
 
-            Result.Error("无法读取模块仓库 JSON: $lastError")
+            Result.Error(tr(R.string.gh_catalog_json_unreadable, lastError))
+        }
+
+    suspend fun fetchRuntimeModuleCatalog(repositoryUrl: String): Result<RuntimeModuleCatalogFetchResult> =
+        withContext(Dispatchers.IO) {
+            val candidates = runtimeModuleCatalogCandidates(repositoryUrl)
+            if (candidates.isEmpty()) {
+                return@withContext Result.Error(tr(R.string.gh_repo_link_unsupported))
+            }
+
+            var lastError = ""
+            for (indexUrl in candidates) {
+                val request = Request.Builder()
+                    .url(indexUrl)
+                    .header("Accept", "application/json,text/plain,*/*")
+                    .build()
+                val response = runCatching { publicHttpClient.newCall(request).execute() }
+                    .getOrElse {
+                        lastError = it.message ?: tr(R.string.gh_network_request_failed)
+                        null
+                    } ?: continue
+
+                response.use { resp ->
+                    if (!resp.isSuccessful) {
+                        lastError = "HTTP ${resp.code}"
+                        return@use
+                    }
+
+                    val body = resp.body?.string().orEmpty()
+                    val catalog = runCatching { parseRuntimeModuleCatalogDocument(body, repositoryUrl) }
+                        .getOrElse {
+                            lastError = tr(R.string.gh_json_parse_failed, it.message ?: tr(R.string.gh_format_error))
+                            return@use
+                        }
+
+                    return@withContext Result.Success(
+                        RuntimeModuleCatalogFetchResult(
+                            name = catalog.name,
+                            indexUrl = indexUrl,
+                            modules = catalog.modules,
+                            skippedCount = catalog.skippedCount
+                        )
+                    )
+                }
+            }
+
+            Result.Error(tr(R.string.gh_catalog_json_unreadable, lastError))
         }
 
     // ── User ──────────────────────────────────────────────────────────────
 
     suspend fun getAuthenticatedUser(): Result<GitHubUser> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.getAuthenticatedUser()
             if (resp.isSuccessful && resp.body() != null) Result.Success(resp.body()!!)
@@ -156,7 +204,7 @@ class GitHubRepository(
     // ── Fork ──────────────────────────────────────────────────────────────
 
     suspend fun getUserFork(sourceOwner: String, sourceRepo: String, username: String): Result<GitHubRepo?> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.getRepo(username, sourceRepo)
             val repo = resp.body()
@@ -172,7 +220,7 @@ class GitHubRepository(
     }
 
     suspend fun forkRepo(owner: String, repo: String): Result<GitHubRepo> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.forkRepo(owner, repo)
             if (resp.isSuccessful && resp.body() != null) Result.Success(resp.body()!!)
@@ -187,7 +235,7 @@ class GitHubRepository(
         headOwner: String,
         headBranch: String
     ): Result<CompareResult> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.compareCommits(
                 sourceOwner,
@@ -200,7 +248,7 @@ class GitHubRepository(
     }
 
     suspend fun syncFork(username: String, repo: String, branch: String): Result<SyncForkResponse> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.syncFork(username, repo, SyncForkRequest(branch))
             if (resp.isSuccessful && resp.body() != null) Result.Success(resp.body()!!)
@@ -211,7 +259,7 @@ class GitHubRepository(
     // ── Workflows ─────────────────────────────────────────────────────────
 
     suspend fun getWorkflow(owner: String, repo: String, workflowFile: String): Result<Workflow> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.listWorkflows(owner, repo)
             if (resp.isSuccessful) {
@@ -239,7 +287,7 @@ class GitHubRepository(
         inputs: Map<String, String>,
         ref: String = "main"
     ): Result<Unit> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.dispatchWorkflow(owner, repo, workflowId.toString(), WorkflowDispatchRequest(ref, inputs))
             if (resp.isSuccessful) Result.Success(Unit)
@@ -248,7 +296,7 @@ class GitHubRepository(
     }
 
     suspend fun enableWorkflow(owner: String, repo: String, workflowId: Long): Result<Unit> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.enableWorkflow(owner, repo, workflowId.toString())
             if (resp.isSuccessful) Result.Success(Unit)
@@ -262,7 +310,7 @@ class GitHubRepository(
         perPage: Int = 10,
         workflowId: Long? = null
     ): Result<List<WorkflowRun>> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<List<WorkflowRun>>> {
             val resp = api.listWorkflowRuns(
                 owner,
@@ -280,7 +328,7 @@ class GitHubRepository(
     }
 
     suspend fun getWorkflowRun(owner: String, repo: String, runId: Long): Result<WorkflowRun> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.getWorkflowRun(owner, repo, runId)
             if (resp.isSuccessful && resp.body() != null) Result.Success(resp.body()!!)
@@ -289,7 +337,7 @@ class GitHubRepository(
     }
 
     suspend fun deleteWorkflowRun(owner: String, repo: String, runId: Long): Result<Unit> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.deleteWorkflowRun(owner, repo, runId)
             when {
@@ -300,7 +348,7 @@ class GitHubRepository(
     }
 
     suspend fun cancelWorkflowRun(owner: String, repo: String, runId: Long): Result<Unit> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching {
             val resp = api.cancelWorkflowRun(owner, repo, runId)
             when {
@@ -311,7 +359,7 @@ class GitHubRepository(
     }
 
     suspend fun listRunJobs(owner: String, repo: String, runId: Long): Result<List<WorkflowJob>> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<List<WorkflowJob>>> {
             val resp = api.listRunJobs(owner, repo, runId)
             if (resp.isSuccessful) {
@@ -324,7 +372,7 @@ class GitHubRepository(
     }
 
     suspend fun downloadJobLogs(owner: String, repo: String, jobId: Long): Result<String> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<String>> {
             val resp = api.downloadJobLogs(owner, repo, jobId)
             if (resp.isSuccessful) {
@@ -337,7 +385,7 @@ class GitHubRepository(
     }
 
     suspend fun downloadRunLogs(owner: String, repo: String, runId: Long): Result<String> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<String>> {
             val resp = api.downloadRunLogs(owner, repo, runId)
             if (resp.isSuccessful) {
@@ -350,7 +398,7 @@ class GitHubRepository(
     }
 
     suspend fun listArtifacts(owner: String, repo: String, runId: Long): Result<List<Artifact>> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<List<Artifact>>> {
             val resp = api.listArtifacts(owner, repo, runId)
             if (resp.isSuccessful) {
@@ -363,7 +411,7 @@ class GitHubRepository(
     }
 
     suspend fun listReleases(owner: String, repo: String, perPage: Int = 100): Result<List<GitHubReleaseSummary>> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<List<GitHubReleaseSummary>>> {
             val collected = mutableListOf<GitHubReleaseSummary>()
             var page = 1
@@ -382,7 +430,7 @@ class GitHubRepository(
     }
 
     suspend fun getReleaseByTag(owner: String, repo: String, tag: String): Result<GitHubRelease?> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<GitHubRelease?>> {
             val resp = api.getReleaseByTag(owner, repo, tag)
             when {
@@ -399,7 +447,7 @@ class GitHubRepository(
         releaseId: Long,
         perPage: Int = 100
     ): Result<List<ReleaseAsset>> {
-        val api = apiService ?: return Result.Error("Not authenticated")
+        val api = apiService
         return runCatching<Result<List<ReleaseAsset>>> {
             val collected = mutableListOf<ReleaseAsset>()
             var page = 1
@@ -466,6 +514,13 @@ class GitHubRepository(
         return emptyList()
     }
 
+    internal fun runtimeModuleCatalogCandidates(repositoryUrl: String): List<String> {
+        val clean = repositoryUrl.trim().trimEnd('/')
+        if (clean.isBlank()) return emptyList()
+        if (clean.endsWith(".json", ignoreCase = true)) return listOf(clean)
+        return emptyList()
+    }
+
     internal fun externalModuleConfCandidates(repositoryUrl: String): List<String> {
         val clean = repositoryUrl.trim().trimEnd('/')
         if (clean.isBlank()) return emptyList()
@@ -512,12 +567,31 @@ class GitHubRepository(
 
     internal fun parseModuleCatalogDocument(body: String, repositoryUrl: String): ParsedModuleCatalogDocument {
         val root = JsonParser.parseString(body)
-        val document = root.asJsonObjectOrNull() ?: error("根节点必须是 JSON 对象")
+        val document = root.asJsonObjectOrNull() ?: error(tr(R.string.gh_root_must_be_object))
         val rawModules = document.arrayOrEmpty("modules")
         val modules = rawModules.mapNotNull { element ->
             element.asJsonObjectOrNull()?.let(::sanitizeCatalogItem)
         }.distinctBy { it.repoUrl.trim().lowercase() }
         return ParsedModuleCatalogDocument(
+            name = document.stringOrEmpty("name").ifBlank { repositoryUrl.toCatalogFallbackName() },
+            modules = modules,
+            skippedCount = (rawModules.size() - modules.size).coerceAtLeast(0)
+        )
+    }
+
+    internal fun parseRuntimeModuleCatalogDocument(
+        body: String,
+        repositoryUrl: String
+    ): ParsedRuntimeModuleCatalogDocument {
+        val root = JsonParser.parseString(body)
+        val document = root.asJsonObjectOrNull() ?: error(tr(R.string.gh_root_must_be_object))
+        val rawModules = document.arrayOrEmpty("modules")
+        val modules = rawModules.mapNotNull { element ->
+            element.asJsonObjectOrNull()?.let(::sanitizeRuntimeCatalogItem)
+        }.distinctBy { item ->
+            item.id.trim().lowercase().ifBlank { item.name.trim().lowercase() }
+        }
+        return ParsedRuntimeModuleCatalogDocument(
             name = document.stringOrEmpty("name").ifBlank { repositoryUrl.toCatalogFallbackName() },
             modules = modules,
             skippedCount = (rawModules.size() - modules.size).coerceAtLeast(0)
@@ -557,10 +631,37 @@ class GitHubRepository(
         )
     }
 
+    private fun sanitizeRuntimeCatalogItem(raw: JsonObject): RuntimeModuleCatalogItem? {
+        val versions = raw.arrayOrEmpty("versions")
+        val latestVersion = versions.firstOrNull()?.asJsonObjectOrNull()
+        val zipUrl = latestVersion?.stringOrEmpty("zipUrl").orEmpty()
+        val name = raw.stringOrEmpty("name")
+        if (name.isBlank() || zipUrl.isBlank()) return null
+        return RuntimeModuleCatalogItem(
+            id = raw.stringOrEmpty("id").ifBlank { name.lowercase().replace(' ', '_') },
+            name = name,
+            version = latestVersion?.stringOrEmpty("version").orEmpty().ifBlank { raw.stringOrEmpty("version") },
+            versionCode = latestVersion?.longOrZero("versionCode").takeIf { it != null && it > 0L }
+                ?: raw.longOrZero("versionCode"),
+            author = raw.stringOrEmpty("author"),
+            description = raw.stringOrEmpty("description"),
+            zipUrl = zipUrl,
+            changelog = latestVersion?.stringOrEmpty("changelog").orEmpty(),
+            support = raw.stringOrEmpty("support"),
+            donate = raw.stringOrEmpty("donate"),
+            website = raw.stringOrEmpty("website"),
+            cover = raw.stringOrEmpty("cover"),
+            icon = raw.stringOrEmpty("icon"),
+            verified = raw.booleanOrFalse("verified"),
+            minApi = raw.intOrNull("minApi"),
+            maxApi = raw.intOrNull("maxApi")
+        )
+    }
+
     internal fun parseExternalModuleConf(body: String): ExternalModuleMetadata {
         val values = parseShellLikeConf(body)
         val name = values["ABK_MODULE_NAME"].orEmpty().trim()
-        if (name.isBlank()) error("缺少 ABK_MODULE_NAME")
+        if (name.isBlank()) error(tr(R.string.gh_missing_module_name))
         val supportedStages = values["ABK_MODULE_SUPPORTED_STAGES"]
             ?.takeIf { it.isNotBlank() }
             ?.split(',')
@@ -647,6 +748,23 @@ class GitHubRepository(
             .map { it.trim() }
             .filter { it.isNotBlank() }
 
+    private fun JsonObject.intOrNull(name: String): Int? =
+        get(name)
+            ?.takeIf { !it.isJsonNull && it.isJsonPrimitive }
+            ?.asInt
+
+    private fun JsonObject.longOrZero(name: String): Long =
+        get(name)
+            ?.takeIf { !it.isJsonNull && it.isJsonPrimitive }
+            ?.asLong
+            ?: 0L
+
+    private fun JsonObject.booleanOrFalse(name: String): Boolean =
+        get(name)
+            ?.takeIf { !it.isJsonNull && it.isJsonPrimitive }
+            ?.asBoolean
+            ?: false
+
     private fun JsonObject.arrayOrEmpty(name: String): JsonArray =
         get(name)?.takeIf { !it.isJsonNull && it.isJsonArray }?.asJsonArray ?: JsonArray()
 
@@ -654,7 +772,7 @@ class GitHubRepository(
         .trimEnd('/')
         .substringAfterLast('/')
         .removeSuffix(".git")
-        .ifBlank { "模块仓库" }
+        .ifBlank { tr(R.string.gh_catalog_fallback_name) }
 
     private companion object {
         const val DEFAULT_LOG_BUFFER_SIZE = 8 * 1024
@@ -671,5 +789,11 @@ internal data class GithubRepositoryParts(
 internal data class ParsedModuleCatalogDocument(
     val name: String,
     val modules: List<ModuleCatalogItem>,
+    val skippedCount: Int
+)
+
+internal data class ParsedRuntimeModuleCatalogDocument(
+    val name: String,
+    val modules: List<RuntimeModuleCatalogItem>,
     val skippedCount: Int
 )

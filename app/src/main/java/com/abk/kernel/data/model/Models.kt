@@ -98,7 +98,7 @@ data class BuildStepProgress(
 
 data class BuildProgress(
     val percent: Int = 0,
-    val currentStep: String = "等待 GitHub 分配 Runner",
+    val currentStep: String = "",
     val completedSteps: Int = 0,
     val totalSteps: Int = 0,
     val steps: List<BuildStepProgress> = emptyList()
@@ -323,12 +323,42 @@ data class ModuleCatalogItem(
     val homepage: String = ""
 )
 
+data class RuntimeModuleCatalogItem(
+    val id: String = "",
+    val name: String = "",
+    val version: String = "",
+    val versionCode: Long = 0L,
+    val author: String = "",
+    val description: String = "",
+    val zipUrl: String = "",
+    val changelog: String = "",
+    val support: String = "",
+    val donate: String = "",
+    val website: String = "",
+    val cover: String = "",
+    val icon: String = "",
+    val verified: Boolean = false,
+    val minApi: Int? = null,
+    val maxApi: Int? = null
+)
+
 data class ModuleCatalogRepository(
     val id: String = "",
     val url: String = "",
     val indexJsonUrl: String = "",
     val name: String = "",
     val modules: List<ModuleCatalogItem> = emptyList(),
+    val lastUpdated: Long = 0L,
+    val error: String? = null,
+    val skippedCount: Int = 0
+)
+
+data class RuntimeModuleRepository(
+    val id: String = "",
+    val url: String = "",
+    val indexJsonUrl: String = "",
+    val name: String = "",
+    val modules: List<RuntimeModuleCatalogItem> = emptyList(),
     val lastUpdated: Long = 0L,
     val error: String? = null,
     val skippedCount: Int = 0
@@ -341,16 +371,38 @@ data class ModuleCatalogFetchResult(
     val skippedCount: Int
 )
 
+data class RuntimeModuleCatalogFetchResult(
+    val name: String,
+    val indexUrl: String,
+    val modules: List<RuntimeModuleCatalogItem>,
+    val skippedCount: Int
+)
+
 const val KSU_BRANCH_STABLE = "Stable(标准)"
 const val KSU_BRANCH_DEV = "Dev(开发)"
+const val KSU_BRANCH_LATEST = "Latest(最新)"
+const val KSU_BRANCH_CUSTOM = "Custom(自定义)"
 const val KSU_VARIANT_NONE = "None"
 const val KSU_VARIANT_OFFICIAL = "Official"
 const val KSU_VARIANT_SUKISU = "SukiSU"
 const val KSU_VARIANT_RESUKISU = "ReSukiSU"
+const val BUILD_TARGET_GKI = "gki"
+const val BUILD_TARGET_ONEPLUS = "oneplus"
 
-val KSU_BRANCH_STANDARD_OPTIONS = listOf(KSU_BRANCH_STABLE, KSU_BRANCH_DEV)
+val KSU_BRANCH_STANDARD_OPTIONS = listOf(
+    KSU_BRANCH_STABLE,
+    KSU_BRANCH_DEV,
+    KSU_BRANCH_LATEST,
+    KSU_BRANCH_CUSTOM,
+)
 val KSU_BRANCH_BUILD_PLAN_OPTIONS = KSU_BRANCH_STANDARD_OPTIONS
 val KSU_VARIANT_OPTIONS = listOf(
+    KSU_VARIANT_OFFICIAL,
+    KSU_VARIANT_SUKISU,
+    KSU_VARIANT_RESUKISU,
+    KSU_VARIANT_NONE
+)
+val ONEPLUS_KSU_VARIANT_OPTIONS = listOf(
     KSU_VARIANT_OFFICIAL,
     KSU_VARIANT_SUKISU,
     KSU_VARIANT_RESUKISU,
@@ -359,6 +411,7 @@ val KSU_VARIANT_OPTIONS = listOf(
 
 // App-level build config model (mirrors kernel-custom.yml inputs)
 data class KernelBuildConfig(
+    val buildTarget: String = BUILD_TARGET_GKI,
     val androidVersion: String = "android12",
     val kernelVersion: String = "5.10",
     val subLevel: String = "66",
@@ -366,6 +419,7 @@ data class KernelBuildConfig(
     val revision: String = "r11",
     val kernelsuVariant: String = KSU_VARIANT_RESUKISU,
     val kernelsuBranch: String = KSU_BRANCH_STABLE,
+    val customRef: String = "",
     val version: String = "",
     val buildTime: String = "",
     val useZram: Boolean = false,
@@ -382,7 +436,13 @@ data class KernelBuildConfig(
     val kpmPassword: String = "",
     val virtualizationSupport: String = "off",
     val useCustomExternalModules: Boolean = false,
-    val customExternalModules: List<CustomExternalModule> = emptyList()
+    val customExternalModules: List<CustomExternalModule> = emptyList(),
+    val onePlusCpu: String = "sm8650",
+    val onePlusDeviceManifest: String = "oneplus_12_b",
+    val onePlusUseLz4kd: Boolean = false,
+    val onePlusUseBbr: Boolean = false,
+    val onePlusUseProxyOptimization: Boolean = true,
+    val onePlusUseUnicodeBypass: Boolean = false
 )
 
 data class AbkRuntimeStatus(
@@ -527,6 +587,17 @@ enum class BuildQueueItemStatus {
     FAILED,
     CANCELLED
 }
+
+data class ActiveDownloadTask(
+    val key: Long,
+    val artifactId: Long,
+    val runId: Long,
+    val name: String,
+    val runTitle: String,
+    val runNumber: Int = 0,
+    val progress: Int = 0,
+    val automatic: Boolean = false
+)
 
 data class DownloadedArtifact(
     val id: Long,

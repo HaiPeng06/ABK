@@ -17,6 +17,7 @@ import android.widget.Toast
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.abk.kernel.R
 import com.abk.kernel.data.repository.PreferencesRepository
 import com.abk.kernel.utils.RootUtils
 import kotlinx.coroutines.flow.first
@@ -43,7 +44,7 @@ class ModuleWebUiActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         if (moduleId.isBlank()) {
-            Toast.makeText(this, "模块不可用", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.runtime_module_unavailable), Toast.LENGTH_SHORT).show()
             finish()
             return
         }
@@ -69,7 +70,7 @@ class ModuleWebUiActivity : Activity() {
             addJavascriptInterface(ModuleWebBridge(this@ModuleWebUiActivity, this, moduleId, moduleDir), "ksu")
         }
         setContentView(webView)
-        webView.loadUrl(WEB_ORIGIN)
+        loadModuleWebPage()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -82,6 +83,24 @@ class ModuleWebUiActivity : Activity() {
             webView.destroy()
         }
         super.onDestroy()
+    }
+
+    private fun loadModuleWebPage() {
+        thread(name = "abk-webui-load") {
+            val indexHtml = RootUtils.readModuleWebResource(moduleId, "index.html")
+                ?: RootUtils.readModuleWebResource(moduleId, "index.htm")
+            if (indexHtml == null) {
+                webView.post {
+                    Toast.makeText(this, getString(R.string.runtime_module_unavailable), Toast.LENGTH_SHORT).show()
+                    finish()
+                }
+                return@thread
+            }
+            val html = indexHtml.toString(Charsets.UTF_8)
+            webView.post {
+                webView.loadDataWithBaseURL(WEB_ORIGIN, html, "text/html", "utf-8", WEB_ORIGIN)
+            }
+        }
     }
 
     private fun enterImmersiveMode() {
